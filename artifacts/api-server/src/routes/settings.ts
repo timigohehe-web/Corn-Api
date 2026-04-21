@@ -57,6 +57,22 @@ function checkApiKey(req: Request, res: Response): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// GET /setup-status — public, no auth required
+// ---------------------------------------------------------------------------
+
+router.get("/setup-status", (_req: Request, res: Response) => {
+  const configured = !!process.env.PROXY_API_KEY;
+  const integrationsReady = !!(
+    process.env.AI_INTEGRATIONS_OPENAI_BASE_URL &&
+    process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL &&
+    process.env.AI_INTEGRATIONS_GEMINI_BASE_URL &&
+    process.env.AI_INTEGRATIONS_OPENROUTER_BASE_URL
+  );
+  const storageReady = !!process.env.DEFAULT_OBJECT_STORAGE_BUCKET_ID;
+  res.json({ configured, integrationsReady, storageReady });
+});
+
+// ---------------------------------------------------------------------------
 // GET /settings/sillytavern — 读取当前设置
 // ---------------------------------------------------------------------------
 
