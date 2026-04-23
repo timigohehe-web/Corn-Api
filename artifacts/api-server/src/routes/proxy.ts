@@ -41,7 +41,7 @@ const OPENROUTER_FEATURED = [
   "cohere/command-a", "amazon/nova-premier-v1", "baidu/ernie-4.5-300b-a47b",
   "z-ai/glm-5.1", "qwen/qwen3.6-plus", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2.5-pro",
   "openai/gpt-5.4", "openai/gpt-5.4-pro", "openai/gpt-5.4-mini", "openai/gpt-5.4-nano",
-  "openai/gpt-5-image", "openai/gpt-5-image-mini",
+  "openai/gpt-5-image", "openai/gpt-5-image-mini", "openai/gpt-5.4-image-2",
   "google/gemini-3.1-flash-image-preview", "google/gemini-3-pro-image-preview", "google/gemini-2.5-flash-image",
 ];
 
@@ -67,6 +67,13 @@ const OPENROUTER_EFFORT_BASE = [
 // Base (plain) variants of these models default to thinking if reasoning is omitted;
 // must explicitly send effort:"none" to disable it.
 const OPENROUTER_EFFORT_NONE_SET = new Set(["minimax/minimax-m2.7", "z-ai/glm-5.1", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2.5-pro"]);
+
+// OpenRouter image-generation models — auto-inject modalities:["image","text"]
+// and normalize response message.images[] → message.content[]
+const OPENROUTER_IMAGE_MODELS = new Set([
+  "openai/gpt-5-image", "openai/gpt-5-image-mini", "openai/gpt-5.4-image-2",
+  "google/gemini-3.1-flash-image-preview", "google/gemini-3-pro-image-preview", "google/gemini-2.5-flash-image",
+]);
 const OPENROUTER_EFFORT_MODELS: string[] = OPENROUTER_EFFORT_BASE.flatMap((id) => [
   `${id}-low`,
   `${id}-high`,
@@ -876,7 +883,7 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         }
 
         const client = makeLocalOpenRouter();
-        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: orReasoning, thinkingVisible: orThinkingVis });
+        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: orReasoning, thinkingVisible: orThinkingVis, isImageModel: OPENROUTER_IMAGE_MODELS.has(orActualModel) });
       } else {
         const client = makeLocalOpenAI();
         result = await handleOpenAI({ req, res, client, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
@@ -1424,8 +1431,30 @@ async function handleFriendProxy({
   return { promptTokens, completionTokens, ttftMs };
 }
 
+function normalizeImageResponse(result: Record<string, unknown>): void {
+  const choices = (result.choices as Array<Record<string, unknown>> | undefined) ?? [];
+  for (const choice of choices) {
+    const msg = choice.message as Record<string, unknown> | undefined;
+    if (!msg) continue;
+    const images = msg.images as Array<{ image_url?: { url?: string } }> | undefined;
+    if (!images?.length) continue;
+    // Convert images[] → content[] with type:"image_url" parts
+    const contentParts: unknown[] = [];
+    if (typeof msg.content === "string" && msg.content) {
+      contentParts.push({ type: "text", text: msg.content });
+    }
+    for (const img of images) {
+      if (img.image_url?.url) {
+        contentParts.push({ type: "image_url", image_url: { url: img.image_url.url } });
+      }
+    }
+    msg.content = contentParts;
+    delete msg.images;
+  }
+}
+
 async function handleOpenAI({
-  req, res, client, model, messages, stream, maxTokens, tools, toolChoice, startTime, reasoning, thinkingVisible,
+  req, res, client, model, messages, stream, maxTokens, tools, toolChoice, startTime, reasoning, thinkingVisible, isImageModel,
 }: {
   req: Request;
   res: Response;
@@ -1439,6 +1468,7 @@ async function handleOpenAI({
   startTime: number;
   reasoning?: { enabled: boolean } | { effort: string };
   thinkingVisible?: boolean;
+  isImageModel?: boolean;
 }): Promise<{ promptTokens: number; completionTokens: number; ttftMs?: number }> {
   const params: Parameters<typeof client.chat.completions.create>[0] = {
     model,
@@ -1449,6 +1479,7 @@ async function handleOpenAI({
   if (tools?.length) (params as Record<string, unknown>)["tools"] = tools;
   if (toolChoice !== undefined) (params as Record<string, unknown>)["tool_choice"] = toolChoice;
   if (reasoning) (params as Record<string, unknown>)["reasoning"] = reasoning;
+  if (isImageModel) (params as Record<string, unknown>)["modalities"] = ["image", "text"];
 
   if (stream) {
     try {
@@ -1512,6 +1543,8 @@ async function handleOpenAI({
         if (msg) delete msg.reasoning;
       }
     }
+    // Image models: normalize message.images[] → message.content[] image_url parts
+    if (isImageModel) normalizeImageResponse(resultRecord);
     res.json(result);
     return {
       promptTokens: result.usage?.prompt_tokens ?? 0,
