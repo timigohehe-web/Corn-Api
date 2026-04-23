@@ -39,7 +39,7 @@ const OPENROUTER_FEATURED = [
   "google/gemini-2.5-pro", "anthropic/claude-opus-4.6", "anthropic/claude-opus-4.6-fast",
   "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.7-fast",
   "cohere/command-a", "amazon/nova-premier-v1", "baidu/ernie-4.5-300b-a47b",
-  "z-ai/glm-5.1", "qwen/qwen3.6-plus", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2-pro",
+  "z-ai/glm-5.1", "qwen/qwen3.6-plus", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2.5-pro",
   "openai/gpt-5.4", "openai/gpt-5.4-pro", "openai/gpt-5.4-mini", "openai/gpt-5.4-nano",
   "openai/gpt-5-image", "openai/gpt-5-image-mini",
   "google/gemini-3.1-flash-image-preview", "google/gemini-3-pro-image-preview", "google/gemini-2.5-flash-image",
@@ -52,7 +52,7 @@ const OPENROUTER_THINKING_BASE = [
   "minimax/minimax-m2.7",
   "z-ai/glm-5.1",
   "moonshotai/kimi-k2.6",
-  "xiaomi/mimo-v2-pro",
+  "xiaomi/mimo-v2.5-pro",
 ];
 const OPENROUTER_THINKING_MODELS: string[] = OPENROUTER_THINKING_BASE.flatMap((id) => [
   `${id}-thinking`,
@@ -66,7 +66,7 @@ const OPENROUTER_EFFORT_BASE = [
 ];
 // Base (plain) variants of these models default to thinking if reasoning is omitted;
 // must explicitly send effort:"none" to disable it.
-const OPENROUTER_EFFORT_NONE_SET = new Set(["minimax/minimax-m2.7", "z-ai/glm-5.1", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2-pro"]);
+const OPENROUTER_EFFORT_NONE_SET = new Set(["minimax/minimax-m2.7", "z-ai/glm-5.1", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2.5-pro"]);
 const OPENROUTER_EFFORT_MODELS: string[] = OPENROUTER_EFFORT_BASE.flatMap((id) => [
   `${id}-low`,
   `${id}-high`,
