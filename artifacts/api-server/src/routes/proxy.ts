@@ -42,7 +42,7 @@ const OPENROUTER_FEATURED = [
   "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
   "deepseek/deepseek-v3.2", "deepseek/deepseek-r1", "deepseek/deepseek-r1-0528",
   "mistralai/mistral-small-2603", "qwen/qwen3.5-122b-a10b",
-  "google/gemini-2.5-pro", "anthropic/claude-opus-4.6", "anthropic/claude-opus-4.6-fast",
+  "google/gemini-2.5-pro", "anthropic/claude-opus-4.6", "anthropic/claude-opus-4.6:online", "anthropic/claude-opus-4.6-fast",
   "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.7-fast",
   "cohere/command-a", "amazon/nova-premier-v1", "baidu/ernie-4.5-300b-a47b",
   "z-ai/glm-5.1", "qwen/qwen3.6-plus", "minimax/minimax-m2.7", "moonshotai/kimi-k2.6", "xiaomi/mimo-v2.5-pro",
