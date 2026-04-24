@@ -991,16 +991,61 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
     max_tokens?: number;
     temperature?: number;
     thinking?: { type: "enabled"; budget_tokens: number };
+    tools?: unknown[];
     [key: string]: unknown;
   };
 
-  const { model, messages, system, stream, max_tokens, ...rest } = body;
-  const selectedModel = model ?? "claude-sonnet-4-5";
-  const maxTokens = max_tokens ?? 4096;
+  const { model, messages, system, stream, max_tokens, tools: clientTools, ...rest } = body;
+  const rawModel = model ?? "claude-sonnet-4-5";
+
+  // Reject disabled models
+  if (!isModelEnabled(rawModel)) {
+    res.status(403).json({ error: { type: "invalid_request_error", message: `Model '${rawModel}' is disabled on this gateway` } });
+    return;
+  }
+
+  // Resolve model-suffix aliases (same system as /v1/chat/completions)
+  const webSearch = rawModel.endsWith("-search");
+  const strippedForThinking = webSearch ? rawModel.replace(/-search$/, "") : rawModel;
+  const thinkingVisible = strippedForThinking.endsWith("-thinking-visible");
+  const thinkingEnabled = thinkingVisible || strippedForThinking.endsWith("-thinking");
+  const selectedModel = thinkingVisible
+    ? strippedForThinking.replace(/-thinking-visible$/, "")
+    : thinkingEnabled
+      ? strippedForThinking.replace(/-thinking$/, "")
+      : strippedForThinking.replace(/-search$/, "");
+
+  // Model-specific max_tokens defaults
+  const CLAUDE_MODEL_MAX: Record<string, number> = {
+    "claude-haiku-4-5": 8096,
+    "claude-sonnet-4-5": 64000,
+    "claude-sonnet-4-6": 64000,
+    "claude-opus-4-1": 64000,
+    "claude-opus-4-5": 64000,
+    "claude-opus-4-6": 64000,
+    "claude-opus-4-7": 64000,
+  };
+  const modelMax = CLAUDE_MODEL_MAX[selectedModel] ?? 32000;
+  const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
+  const maxTokens = max_tokens ?? defaultMaxTokens;
+
   const shouldStream = stream ?? false;
   const startTime = Date.now();
 
-  req.log.info({ model: selectedModel, stream: shouldStream }, "Anthropic /v1/messages request");
+  req.log.info({ model: selectedModel, rawModel, stream: shouldStream, webSearch, thinkingEnabled }, "Anthropic /v1/messages request");
+
+  // Build thinking param if needed (and not already provided by client)
+  const isAdaptiveThinkingModel = selectedModel.includes("4-7") || selectedModel.includes("4.7");
+  const THINKING_BUDGET = 16000;
+  const thinkingParam = thinkingEnabled && !rest.thinking
+    ? isAdaptiveThinkingModel
+      ? { thinking: { type: "adaptive" as const }, output_config: { effort: "xhigh" } }
+      : { thinking: { type: "enabled" as const, budget_tokens: THINKING_BUDGET } }
+    : {};
+
+  // Inject web_search tool if needed, alongside any client-supplied tools
+  const webSearchTool = webSearch ? [{ type: "web_search", name: "web_search_20260209" }] : [];
+  const mergedTools = [...webSearchTool, ...(clientTools ?? [])];
 
   try {
     const client = makeLocalAnthropic();
@@ -1010,6 +1055,8 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       max_tokens: maxTokens,
       messages,
       ...(system ? { system } : {}),
+      ...thinkingParam,
+      ...(mergedTools.length ? { tools: mergedTools } : {}),
       ...rest,
     } as Parameters<typeof client.messages.create>[0];
 
