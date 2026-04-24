@@ -62,13 +62,10 @@ const OPENROUTER_THINKING_BASE = [
   "moonshotai/kimi-k2.6",
   "xiaomi/mimo-v2.5-pro",
 ];
-const OPENROUTER_THINKING_MODELS: string[] = OPENROUTER_THINKING_BASE.flatMap((id) => [
-  `${id}-thinking`,
-  `${id}-thinking-visible`,
-]);
+const OPENROUTER_THINKING_MODELS: string[] = OPENROUTER_THINKING_BASE.map((id) => `${id}-thinking`);
 
 // OpenRouter models with effort-based reasoning (always-on, no plain variant).
-// Exposed as <base>-low / <base>-high (hidden) and <base>-low-thinking-visible / <base>-high-thinking-visible
+// Exposed as <base>-low / <base>-high (always visible)
 const OPENROUTER_EFFORT_BASE = [
   "google/gemini-3.1-pro-preview",
 ];
@@ -90,16 +87,13 @@ const OPENROUTER_IMAGE_MODELS = new Set([...OPENROUTER_IMAGE_TEXT_MODELS, ...OPE
 const OPENROUTER_EFFORT_MODELS: string[] = OPENROUTER_EFFORT_BASE.flatMap((id) => [
   `${id}-low`,
   `${id}-high`,
-  `${id}-low-thinking-visible`,
-  `${id}-high-thinking-visible`,
 ]);
 
 const OPENAI_MODELS = OPENAI_CHAT_MODELS.map((id) => ({ id, description: "OpenAI model" }));
 const CLAUDE_MODELS = [
   ...ANTHROPIC_BASE_MODELS.flatMap((id) => [
     { id, description: "Anthropic Claude model" },
-    { id: `${id}-thinking`, description: "Extended thinking (hidden)" },
-    { id: `${id}-thinking-visible`, description: "Extended thinking (visible)" },
+    { id: `${id}-thinking`, description: "Extended thinking" },
   ]),
   ...ANTHROPIC_SEARCH_MODELS.map((id) => ({ id, description: "Anthropic Claude with built-in web search" })),
 ];
@@ -110,11 +104,10 @@ const ALL_MODELS = [
   ...ANTHROPIC_BASE_MODELS.flatMap((id) => [
     { id },
     { id: `${id}-thinking` },
-    { id: `${id}-thinking-visible` },
   ]),
   ...ANTHROPIC_SEARCH_MODELS.map((id) => ({ id })),
   ...GEMINI_BASE_MODELS.flatMap((id) => [
-    { id }, { id: `${id}-thinking` }, { id: `${id}-thinking-visible` },
+    { id }, { id: `${id}-thinking` },
   ]),
   ...OPENROUTER_FEATURED.map((id) => ({ id })),
   ...OPENROUTER_THINKING_MODELS.map((id) => ({ id })),
@@ -163,13 +156,11 @@ for (const id of OPENAI_THINKING_ALIASES) { MODEL_PROVIDER_MAP.set(id, "openai")
 for (const base of ANTHROPIC_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(base, "anthropic");
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "anthropic");
-  MODEL_PROVIDER_MAP.set(`${base}-thinking-visible`, "anthropic");
 }
 for (const id of ANTHROPIC_SEARCH_MODELS) { MODEL_PROVIDER_MAP.set(id, "anthropic"); }
 for (const base of GEMINI_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(base, "gemini");
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "gemini");
-  MODEL_PROVIDER_MAP.set(`${base}-thinking-visible`, "gemini");
 }
 for (const id of OPENROUTER_FEATURED) { MODEL_PROVIDER_MAP.set(id, "openrouter"); }
 for (const id of OPENROUTER_THINKING_MODELS) { MODEL_PROVIDER_MAP.set(id, "openrouter"); }
@@ -838,20 +829,9 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         result = await handleFriendProxy({ req, res, backend, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
       } else if (isClaudeModel) {
         const webSearch = selectedModel.endsWith("-search");
-        const strippedForThinking = webSearch ? selectedModel.replace(/-search$/, "") : selectedModel;
-        const thinkingVisible = strippedForThinking.endsWith("-thinking-visible");
-        const thinkingEnabled = thinkingVisible || strippedForThinking.endsWith("-thinking");
-        const actualModel = webSearch
-          ? strippedForThinking.replace(/-thinking-visible$/, "").replace(/-thinking$/, "").replace(/-search$/, "") + ""
-          : thinkingVisible
-            ? selectedModel.replace(/-thinking-visible$/, "")
-            : thinkingEnabled
-              ? selectedModel.replace(/-thinking$/, "")
-              : selectedModel;
-        // For search models, map the search ID to its underlying base model
-        const resolvedModel = webSearch
-          ? selectedModel.replace(/-search$/, "")
-          : actualModel;
+        const stripped = webSearch ? selectedModel.replace(/-search$/, "") : selectedModel;
+        const thinkingEnabled = stripped.endsWith("-thinking");
+        const resolvedModel = thinkingEnabled ? stripped.replace(/-thinking$/, "") : stripped;
         const CLAUDE_MODEL_MAX: Record<string, number> = {
           "claude-haiku-4-5": 8096,
           "claude-sonnet-4-5": 64000,
@@ -864,41 +844,24 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         const modelMax = CLAUDE_MODEL_MAX[resolvedModel] ?? 32000;
         const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
         const client = makeLocalAnthropic();
-        result = await handleClaude({ req, res, client, model: resolvedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible, tools, toolChoice: tool_choice, webSearch, startTime });
+        result = await handleClaude({ req, res, client, model: resolvedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible: thinkingEnabled, tools, toolChoice: tool_choice, webSearch, startTime });
       } else if (isGeminiModel) {
-        const thinkingVisible = selectedModel.endsWith("-thinking-visible");
-        const thinkingEnabled = thinkingVisible || selectedModel.endsWith("-thinking");
-        const actualModel = thinkingVisible
-          ? selectedModel.replace(/-thinking-visible$/, "")
-          : thinkingEnabled
-            ? selectedModel.replace(/-thinking$/, "")
-            : selectedModel;
-        result = await handleGemini({ req, res, model: actualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, thinking: thinkingEnabled, thinkingVisible, startTime });
+        const thinkingEnabled = selectedModel.endsWith("-thinking");
+        const actualModel = thinkingEnabled ? selectedModel.replace(/-thinking$/, "") : selectedModel;
+        result = await handleGemini({ req, res, model: actualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, thinking: thinkingEnabled, thinkingVisible: thinkingEnabled, startTime });
       } else if (isOpenRouterModel) {
-        // Detect effort-based models: <base>-low[-thinking-visible] or <base>-high[-thinking-visible]
-        const orEffortVisibleMatch = selectedModel.match(/^(.+)-(low|high)-thinking-visible$/);
-        const orEffortHiddenMatch = !orEffortVisibleMatch && selectedModel.match(/^(.+)-(low|high)$/);
-        const orThinkingVisible = !orEffortVisibleMatch && !orEffortHiddenMatch && selectedModel.endsWith("-thinking-visible");
-        const orThinkingEnabled = !orEffortVisibleMatch && !orEffortHiddenMatch && (orThinkingVisible || selectedModel.endsWith("-thinking"));
+        // Detect effort-based models: <base>-low or <base>-high (always visible)
+        const orEffortMatch = selectedModel.match(/^(.+)-(low|high)$/);
+        const orThinkingEnabled = !orEffortMatch && selectedModel.endsWith("-thinking");
 
         let orActualModel: string;
         let orReasoning: { enabled: boolean } | { effort: string } | undefined;
-        let orThinkingVis: boolean;
 
-        if (orEffortVisibleMatch) {
-          orActualModel = orEffortVisibleMatch[1];
-          orReasoning = { effort: orEffortVisibleMatch[2] };
-          orThinkingVis = true;
-        } else if (orEffortHiddenMatch) {
-          orActualModel = orEffortHiddenMatch[1];
-          orReasoning = { effort: orEffortHiddenMatch[2] };
-          orThinkingVis = false;
+        if (orEffortMatch) {
+          orActualModel = orEffortMatch[1];
+          orReasoning = { effort: orEffortMatch[2] };
         } else {
-          orActualModel = orThinkingVisible
-            ? selectedModel.replace(/-thinking-visible$/, "")
-            : orThinkingEnabled
-              ? selectedModel.replace(/-thinking$/, "")
-              : selectedModel;
+          orActualModel = orThinkingEnabled ? selectedModel.replace(/-thinking$/, "") : selectedModel;
           if (orThinkingEnabled) {
             orReasoning = { enabled: true };
           } else if (OPENROUTER_EFFORT_NONE_SET.has(orActualModel)) {
@@ -906,7 +869,6 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
           } else {
             orReasoning = undefined;
           }
-          orThinkingVis = orThinkingVisible;
         }
 
         // Client-provided reasoning takes priority over the model-suffix-derived value
@@ -918,7 +880,7 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
           : OPENROUTER_IMAGE_ONLY_MODELS.has(orActualModel)
             ? ["image"] as const
             : undefined;
-        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: finalOrReasoning, thinkingVisible: orThinkingVis, imageModalities: orImageModalities });
+        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: finalOrReasoning, thinkingVisible: !!(orThinkingEnabled || orEffortMatch), imageModalities: orImageModalities });
       } else {
         const client = makeLocalOpenAI();
         result = await handleOpenAI({ req, res, client, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
@@ -1006,14 +968,9 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
 
   // Resolve model-suffix aliases (same system as /v1/chat/completions)
   const webSearch = rawModel.endsWith("-search");
-  const strippedForThinking = webSearch ? rawModel.replace(/-search$/, "") : rawModel;
-  const thinkingVisible = strippedForThinking.endsWith("-thinking-visible");
-  const thinkingEnabled = thinkingVisible || strippedForThinking.endsWith("-thinking");
-  const selectedModel = thinkingVisible
-    ? strippedForThinking.replace(/-thinking-visible$/, "")
-    : thinkingEnabled
-      ? strippedForThinking.replace(/-thinking$/, "")
-      : strippedForThinking.replace(/-search$/, "");
+  const stripped = webSearch ? rawModel.replace(/-search$/, "") : rawModel;
+  const thinkingEnabled = stripped.endsWith("-thinking");
+  const selectedModel = thinkingEnabled ? stripped.replace(/-thinking$/, "") : stripped;
 
   // Model-specific max_tokens defaults
   const CLAUDE_MODEL_MAX: Record<string, number> = {
@@ -1032,7 +989,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   const shouldStream = stream ?? false;
   const startTime = Date.now();
 
-  req.log.info({ model: selectedModel, rawModel, stream: shouldStream, webSearch, thinkingEnabled }, "Anthropic /v1/messages request");
+  req.log.info({ model: selectedModel, rawModel, stream: shouldStream, webSearch, thinking: thinkingEnabled }, "Anthropic /v1/messages request");
 
   // Build thinking param if needed (and not already provided by client)
   const isAdaptiveThinkingModel = selectedModel.includes("4-7") || selectedModel.includes("4.7");
