@@ -1492,6 +1492,19 @@ async function handleOpenAI({
   if (reasoning) (params as Record<string, unknown>)["reasoning"] = reasoning;
   if (imageModalities) (params as Record<string, unknown>)["modalities"] = imageModalities;
 
+  // Image models don't support streaming — always return non-streaming response
+  // to avoid base64 content being split across SSE chunks incorrectly
+  if (imageModalities && stream) {
+    const result = await client.chat.completions.create({ ...params, stream: false });
+    const resultRecord = result as unknown as Record<string, unknown>;
+    normalizeImageResponse(resultRecord);
+    res.json(result);
+    return {
+      promptTokens: result.usage?.prompt_tokens ?? 0,
+      completionTokens: result.usage?.completion_tokens ?? 0,
+    };
+  }
+
   if (stream) {
     try {
       setSseHeaders(res);
