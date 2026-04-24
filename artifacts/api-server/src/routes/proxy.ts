@@ -1556,11 +1556,8 @@ async function handleOpenAI({
         // OpenRouter returns reasoning content in delta.reasoning — remap to reasoning_content
         const orReasoning = delta?.reasoning as string | undefined;
         if (orReasoning) {
-          if (thinkingVisible) {
-            const reasoningChunk = { ...chunk, choices: [{ ...chunk.choices?.[0], delta: { reasoning_content: orReasoning } }] };
-            writeAndFlush(res, `data: ${JSON.stringify(reasoningChunk)}\n\n`);
-          }
-          // skip the raw reasoning chunk from being forwarded as-is
+          const reasoningChunk = { ...chunk, choices: [{ ...chunk.choices?.[0], delta: { reasoning_content: orReasoning } }] };
+          writeAndFlush(res, `data: ${JSON.stringify(reasoningChunk)}\n\n`);
           continue;
         }
         writeAndFlush(res, `data: ${JSON.stringify(chunk)}\n\n`);
@@ -1577,8 +1574,8 @@ async function handleOpenAI({
   } else {
     const result = await client.chat.completions.create({ ...params, stream: false });
     const resultRecord = result as unknown as Record<string, unknown>;
-    // OpenRouter non-stream: remap reasoning to reasoning_content for -thinking-visible
-    if (thinkingVisible) {
+    // OpenRouter non-stream: remap reasoning to reasoning_content whenever present
+    {
       const choices = (resultRecord.choices as Array<Record<string, unknown>> | undefined) ?? [];
       for (const choice of choices) {
         const msg = choice.message as Record<string, unknown> | undefined;
@@ -1586,13 +1583,6 @@ async function handleOpenAI({
           msg.reasoning_content = msg.reasoning;
           delete msg.reasoning;
         }
-      }
-    } else if (reasoning) {
-      // -thinking (hidden): strip reasoning from response
-      const choices = (resultRecord.choices as Array<Record<string, unknown>> | undefined) ?? [];
-      for (const choice of choices) {
-        const msg = choice.message as Record<string, unknown> | undefined;
-        if (msg) delete msg.reasoning;
       }
     }
     // Image models: normalize message.images[] → message.content[] image_url parts
@@ -1671,7 +1661,7 @@ async function handleGemini({
   if (thinking) {
     generationConfig.thinkingConfig = {
       thinkingBudget: maxTokens ? Math.min(maxTokens, 32768) : 16384,
-      includeThoughts: thinkingVisible,
+      includeThoughts: true,
     };
   }
 
@@ -1722,7 +1712,6 @@ async function handleGemini({
             const isThought = !!part.thought;
             const text = part.text ?? "";
             if (!text) continue;
-            if (isThought && !thinkingVisible) continue;
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             const delta: Record<string, string> = isThought
               ? { reasoning_content: text }
@@ -1756,7 +1745,7 @@ async function handleGemini({
       const pTokens = fallbackJson.usageMetadata?.promptTokenCount ?? 0;
       const cTokens = fallbackJson.usageMetadata?.candidatesTokenCount ?? 0;
       const msg: Record<string, string> = { role: "assistant", content: fbAnswer };
-      if (thinkingVisible && fbReasoning) msg.reasoning_content = fbReasoning;
+      if (fbReasoning) msg.reasoning_content = fbReasoning;
       const json = {
         id: `chatcmpl-${Date.now()}`, object: "chat.completion",
         created: Math.floor(Date.now() / 1000), model,
@@ -1777,7 +1766,7 @@ async function handleGemini({
     const promptTokens = data.usageMetadata?.promptTokenCount ?? 0;
     const completionTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
     const message: Record<string, string> = { role: "assistant", content: answer };
-    if (thinkingVisible && reasoning) message.reasoning_content = reasoning;
+    if (reasoning) message.reasoning_content = reasoning;
 
     res.json({
       id: `chatcmpl-${Date.now()}`,
@@ -1904,10 +1893,8 @@ async function handleClaude({
           const delta = event.delta;
 
           if (delta.type === "thinking_delta") {
-            if (thinkingVisible) {
-              const cleaned = delta.thinking.replace(/<\/?think>/g, "");
-              if (cleaned) writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning_content: cleaned }, finish_reason: null }] })}\n\n`);
-            }
+            const cleaned = delta.thinking.replace(/<\/?think>/g, "");
+            if (cleaned) writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { reasoning_content: cleaned }, finish_reason: null }] })}\n\n`);
           } else if (delta.type === "text_delta") {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }] })}\n\n`);
@@ -1987,7 +1974,7 @@ async function handleClaude({
         index: 0,
         message: {
           role: "assistant",
-          ...(thinkingVisible && reasoning ? { reasoning_content: reasoning } : {}),
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
           content: text || null,
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
