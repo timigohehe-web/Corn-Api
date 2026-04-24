@@ -792,7 +792,7 @@ function convertMessagesForClaude(messages: OAIMessage[]): AnthropicMessage[] {
 }
 
 router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Response) => {
-  const { model, messages, stream, max_tokens, temperature, top_p, tools, tool_choice } = req.body as {
+  const { model, messages, stream, max_tokens, temperature, top_p, tools, tool_choice, reasoning: clientReasoning } = req.body as {
     model?: string;
     messages: OAIMessage[];
     stream?: boolean;
@@ -801,6 +801,7 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
     top_p?: number;
     tools?: OAITool[];
     tool_choice?: unknown;
+    reasoning?: { effort?: string; enabled?: boolean };
   };
 
   // Reject disabled models early
@@ -908,13 +909,16 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
           orThinkingVis = orThinkingVisible;
         }
 
+        // Client-provided reasoning takes priority over the model-suffix-derived value
+        const finalOrReasoning = clientReasoning ?? orReasoning;
+
         const client = makeLocalOpenRouter();
         const orImageModalities = OPENROUTER_IMAGE_TEXT_MODELS.has(orActualModel)
           ? ["image", "text"] as const
           : OPENROUTER_IMAGE_ONLY_MODELS.has(orActualModel)
             ? ["image"] as const
             : undefined;
-        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: orReasoning, thinkingVisible: orThinkingVis, imageModalities: orImageModalities });
+        result = await handleOpenAI({ req, res, client, model: orActualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime, reasoning: finalOrReasoning, thinkingVisible: orThinkingVis, imageModalities: orImageModalities });
       } else {
         const client = makeLocalOpenAI();
         result = await handleOpenAI({ req, res, client, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
