@@ -1013,7 +1013,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
     : {};
 
   // Inject web_search tool if needed, alongside any client-supplied tools
-  const webSearchTool = webSearch ? [{ type: "web_search_20250305" }] : [];
+  const webSearchTool = webSearch ? [{ type: "web_search_20250305", name: "web_search" }] : [];
   const mergedTools = [...webSearchTool, ...(clientTools ?? [])];
 
   try {
@@ -1834,7 +1834,7 @@ async function handleClaude({
 
   // Inject Anthropic built-in web search tool when webSearch is enabled
   const webSearchTool = webSearch
-    ? [{ type: "web_search_20250305" as const }]
+    ? [{ type: "web_search_20250305" as const, name: "web_search" as const }]
     : [];
   const allAnthropicTools = webSearchTool.length
     ? [...webSearchTool, ...(anthropicTools ?? [])]
