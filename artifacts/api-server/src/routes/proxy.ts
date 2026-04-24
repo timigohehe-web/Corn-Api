@@ -166,6 +166,17 @@ for (const id of OPENROUTER_FEATURED) { MODEL_PROVIDER_MAP.set(id, "openrouter")
 for (const id of OPENROUTER_THINKING_MODELS) { MODEL_PROVIDER_MAP.set(id, "openrouter"); }
 for (const id of OPENROUTER_EFFORT_MODELS) { MODEL_PROVIDER_MAP.set(id, "openrouter"); }
 
+// Strip legacy -visible suffix for backward compatibility.
+// -low-thinking-visible / -high-thinking-visible → -low / -high
+// -thinking-visible → -thinking
+function stripVisibleSuffix(m: string): string {
+  if (m.endsWith("-low-thinking-visible") || m.endsWith("-high-thinking-visible"))
+    return m.replace(/-thinking-visible$/, "");
+  if (m.endsWith("-thinking-visible"))
+    return m.replace(/-visible$/, "");
+  return m;
+}
+
 let disabledModels: Set<string> = new Set<string>();
 
 function saveDisabledModels(set: Set<string>): void {
@@ -795,13 +806,14 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
     reasoning?: { effort?: string; enabled?: boolean };
   };
 
+  // Normalize: strip legacy -visible suffix before any other processing
+  const selectedModel = model ? stripVisibleSuffix(model) : model;
+
   // Reject disabled models early
-  if (model && !isModelEnabled(model)) {
-    res.status(403).json({ error: { message: `Model '${model}' is disabled on this gateway`, type: "invalid_request_error", code: "model_disabled" } });
+  if (selectedModel && !isModelEnabled(selectedModel)) {
+    res.status(403).json({ error: { message: `Model '${selectedModel}' is disabled on this gateway`, type: "invalid_request_error", code: "model_disabled" } });
     return;
   }
-
-  const selectedModel = model;
   const provider = MODEL_PROVIDER_MAP.get(selectedModel) ?? "openai";
   const isClaudeModel = provider === "anthropic";
   const isGeminiModel = provider === "gemini";
@@ -958,7 +970,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   };
 
   const { model, messages, system, stream, max_tokens, tools: clientTools, ...rest } = body;
-  const rawModel = model ?? "claude-sonnet-4-5";
+  const rawModel = stripVisibleSuffix(model ?? "claude-sonnet-4-5");
 
   // Reject disabled models
   if (!isModelEnabled(rawModel)) {
