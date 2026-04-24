@@ -1451,17 +1451,17 @@ function normalizeImageResponse(result: Record<string, unknown>): void {
     if (!msg) continue;
     const images = msg.images as Array<{ image_url?: { url?: string } }> | undefined;
     if (!images?.length) continue;
-    // Convert images[] → content[] with type:"image_url" parts
-    const contentParts: unknown[] = [];
+    // Convert images[] → markdown image string in content
+    const parts: string[] = [];
     if (typeof msg.content === "string" && msg.content) {
-      contentParts.push({ type: "text", text: msg.content });
+      parts.push(msg.content);
     }
     for (const img of images) {
       if (img.image_url?.url) {
-        contentParts.push({ type: "image_url", image_url: { url: img.image_url.url } });
+        parts.push(`![image](${img.image_url.url})`);
       }
     }
-    msg.content = contentParts;
+    msg.content = parts.join("\n\n");
     delete msg.images;
   }
 }
