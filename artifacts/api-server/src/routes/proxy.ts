@@ -26,6 +26,11 @@ const ANTHROPIC_BASE_MODELS = [
   "claude-haiku-4-5",
 ];
 
+// Models with Anthropic built-in web search injected automatically
+const ANTHROPIC_SEARCH_MODELS = [
+  "claude-opus-4-6-search",
+];
+
 const GEMINI_BASE_MODELS = [
   "gemini-3.1-pro-preview", "gemini-3-flash-preview",
   "gemini-2.5-pro", "gemini-2.5-flash",
@@ -90,11 +95,14 @@ const OPENROUTER_EFFORT_MODELS: string[] = OPENROUTER_EFFORT_BASE.flatMap((id) =
 ]);
 
 const OPENAI_MODELS = OPENAI_CHAT_MODELS.map((id) => ({ id, description: "OpenAI model" }));
-const CLAUDE_MODELS = ANTHROPIC_BASE_MODELS.flatMap((id) => [
-  { id, description: "Anthropic Claude model" },
-  { id: `${id}-thinking`, description: "Extended thinking (hidden)" },
-  { id: `${id}-thinking-visible`, description: "Extended thinking (visible)" },
-]);
+const CLAUDE_MODELS = [
+  ...ANTHROPIC_BASE_MODELS.flatMap((id) => [
+    { id, description: "Anthropic Claude model" },
+    { id: `${id}-thinking`, description: "Extended thinking (hidden)" },
+    { id: `${id}-thinking-visible`, description: "Extended thinking (visible)" },
+  ]),
+  ...ANTHROPIC_SEARCH_MODELS.map((id) => ({ id, description: "Anthropic Claude with built-in web search" })),
+];
 
 const ALL_MODELS = [
   ...OPENAI_CHAT_MODELS.map((id) => ({ id })),
@@ -104,6 +112,7 @@ const ALL_MODELS = [
     { id: `${id}-thinking` },
     { id: `${id}-thinking-visible` },
   ]),
+  ...ANTHROPIC_SEARCH_MODELS.map((id) => ({ id })),
   ...GEMINI_BASE_MODELS.flatMap((id) => [
     { id }, { id: `${id}-thinking` }, { id: `${id}-thinking-visible` },
   ]),
@@ -156,6 +165,7 @@ for (const base of ANTHROPIC_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "anthropic");
   MODEL_PROVIDER_MAP.set(`${base}-thinking-visible`, "anthropic");
 }
+for (const id of ANTHROPIC_SEARCH_MODELS) { MODEL_PROVIDER_MAP.set(id, "anthropic"); }
 for (const base of GEMINI_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(base, "gemini");
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "gemini");
@@ -826,13 +836,21 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         triedFriendUrls.add(backend.url);
         result = await handleFriendProxy({ req, res, backend, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
       } else if (isClaudeModel) {
-        const thinkingVisible = selectedModel.endsWith("-thinking-visible");
-        const thinkingEnabled = thinkingVisible || selectedModel.endsWith("-thinking");
-        const actualModel = thinkingVisible
-          ? selectedModel.replace(/-thinking-visible$/, "")
-          : thinkingEnabled
-            ? selectedModel.replace(/-thinking$/, "")
-            : selectedModel;
+        const webSearch = selectedModel.endsWith("-search");
+        const strippedForThinking = webSearch ? selectedModel.replace(/-search$/, "") : selectedModel;
+        const thinkingVisible = strippedForThinking.endsWith("-thinking-visible");
+        const thinkingEnabled = thinkingVisible || strippedForThinking.endsWith("-thinking");
+        const actualModel = webSearch
+          ? strippedForThinking.replace(/-thinking-visible$/, "").replace(/-thinking$/, "").replace(/-search$/, "") + ""
+          : thinkingVisible
+            ? selectedModel.replace(/-thinking-visible$/, "")
+            : thinkingEnabled
+              ? selectedModel.replace(/-thinking$/, "")
+              : selectedModel;
+        // For search models, map the search ID to its underlying base model
+        const resolvedModel = webSearch
+          ? selectedModel.replace(/-search$/, "")
+          : actualModel;
         const CLAUDE_MODEL_MAX: Record<string, number> = {
           "claude-haiku-4-5": 8096,
           "claude-sonnet-4-5": 64000,
@@ -842,10 +860,10 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
           "claude-opus-4-6": 64000,
           "claude-opus-4-7": 64000,
         };
-        const modelMax = CLAUDE_MODEL_MAX[actualModel] ?? 32000;
+        const modelMax = CLAUDE_MODEL_MAX[resolvedModel] ?? 32000;
         const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
         const client = makeLocalAnthropic();
-        result = await handleClaude({ req, res, client, model: actualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible, tools, toolChoice: tool_choice, startTime });
+        result = await handleClaude({ req, res, client, model: resolvedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible, tools, toolChoice: tool_choice, webSearch, startTime });
       } else if (isGeminiModel) {
         const thinkingVisible = selectedModel.endsWith("-thinking-visible");
         const thinkingEnabled = thinkingVisible || selectedModel.endsWith("-thinking");
@@ -1766,7 +1784,7 @@ async function handleGemini({
 }
 
 async function handleClaude({
-  req, res, client, model, messages, stream, maxTokens, temperature, topP, thinking = false, thinkingVisible = false, tools, toolChoice, startTime,
+  req, res, client, model, messages, stream, maxTokens, temperature, topP, thinking = false, thinkingVisible = false, tools, toolChoice, webSearch = false, startTime,
 }: {
   req: Request;
   res: Response;
@@ -1781,6 +1799,7 @@ async function handleClaude({
   thinkingVisible?: boolean;
   tools?: OAITool[];
   toolChoice?: unknown;
+  webSearch?: boolean;
   startTime: number;
 }): Promise<{ promptTokens: number; completionTokens: number; ttftMs?: number }> {
   const THINKING_BUDGET = 16000;
@@ -1803,6 +1822,15 @@ async function handleClaude({
 
   // Convert tools to Anthropic format
   const anthropicTools = tools?.length ? convertToolsForClaude(tools) : undefined;
+
+  // Inject Anthropic built-in web search tool when webSearch is enabled
+  const webSearchTool = webSearch
+    ? [{ type: "web_search" as const, name: "web_search_20260209" as const }]
+    : [];
+  const allAnthropicTools = webSearchTool.length
+    ? [...webSearchTool, ...(anthropicTools ?? [])]
+    : anthropicTools;
+
   // Convert tool_choice
   let anthropicToolChoice: unknown;
   if (toolChoice !== undefined && anthropicTools?.length) {
@@ -1823,7 +1851,7 @@ async function handleClaude({
     ...(systemMessages ? { system: systemMessages } : {}),
     ...thinkingParam,
     messages: chatMessages,
-    ...(anthropicTools?.length ? { tools: anthropicTools } : {}),
+    ...(allAnthropicTools?.length ? { tools: allAnthropicTools } : {}),
     ...(anthropicToolChoice ? { tool_choice: anthropicToolChoice } : {}),
   });
 
