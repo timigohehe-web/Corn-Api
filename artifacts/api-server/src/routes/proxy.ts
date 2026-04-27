@@ -956,63 +956,157 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 // Accepts Anthropic API format directly (for clients like Cherry Studio, Claude.ai compatible tools)
 // ---------------------------------------------------------------------------
 
+const TOOL_ID_MARKER_RE = /<!--\s*tool_id:([^-\s]+?)\s*-->/g;
+
+/**
+ * Inject a hidden <!-- tool_id:xxx --> marker into the first text block of a
+ * non-streaming Anthropic response that contains tool_use blocks.
+ * This lets clients that strip tool_use metadata still carry the id in text,
+ * so we can recover it on the next request without scanning history.
+ */
+function injectToolIdMarker(
+  content: Record<string, unknown>[]
+): Record<string, unknown>[] {
+  let lastToolUseId: string | undefined;
+  let markerInjected = false;
+  return content.map((block) => {
+    // Both regular tool_use and built-in server_tool_use (e.g. web_search_20250305)
+    if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
+      lastToolUseId = block.id as string;
+      markerInjected = false;
+      return block;
+    }
+    if (block.type === "text" && lastToolUseId && !markerInjected) {
+      markerInjected = true;
+      return { ...block, text: `<!-- tool_id:${lastToolUseId}-->` + (block.text ?? "") };
+    }
+    return block;
+  });
+}
+
 /**
  * Sanitize Anthropic messages before forwarding to the API:
- * - Fill in missing `tool_use_id` on tool_result blocks by scanning backwards
- *   through the conversation to find the matching tool_use block.
- * - Drop any tool_result block whose tool_use_id still cannot be resolved
- *   (sending an invalid/missing id causes a Vertex AI 400 error).
- * - Remove user messages that become empty after stripping bad tool_result blocks.
+ *
+ * 1. Extract <!-- tool_id:xxx --> markers that were previously injected into
+ *    assistant text replies, and use those ids to fill in missing tool_use_id
+ *    fields on tool_result blocks in the following user message.
+ * 2. Strip the markers from assistant text before forwarding upstream.
+ * 3. As a fallback, scan assistant messages for tool_use blocks when no marker
+ *    is present (handles old history that pre-dates the marker injection).
+ * 4. Drop any tool_result block that still has no resolvable id.
+ * 5. Remove user messages that become empty after dropping bad blocks.
  */
 function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
-  // Build a complete ordered list of all tool_use ids seen in assistant messages,
-  // keyed by their position in the messages array so we can match by proximity.
-  type ToolUseEntry = { msgIndex: number; id: string; used: boolean };
-  const allToolUses: ToolUseEntry[] = [];
+  // ── Pass 1: collect marker-based ids & fallback tool_use ids per message ──
+  type IdSource = { ids: string[]; msgIndex: number };
+  const markerIdsByMsg = new Map<number, IdSource>(); // assistant msgIndex → ids from markers
+  const toolUseIdsByMsg = new Map<number, IdSource>(); // assistant msgIndex → ids from tool_use blocks
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      for (const block of msg.content as Record<string, unknown>[]) {
-        if (block.type === "tool_use" && typeof block.id === "string") {
-          allToolUses.push({ msgIndex: i, id: block.id as string, used: false });
+    if (msg.role !== "assistant") continue;
+    const blocks = Array.isArray(msg.content) ? (msg.content as Record<string, unknown>[]) : [];
+
+    const markerIds: string[] = [];
+    const toolUseIds: string[] = [];
+
+    for (const block of blocks) {
+      if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
+        toolUseIds.push(block.id as string);
+      }
+      if (block.type === "text" && typeof block.text === "string") {
+        for (const m of (block.text as string).matchAll(TOOL_ID_MARKER_RE)) {
+          markerIds.push(m[1]);
         }
       }
     }
+
+    if (markerIds.length > 0) markerIdsByMsg.set(i, { ids: markerIds, msgIndex: i });
+    if (toolUseIds.length > 0) toolUseIdsByMsg.set(i, { ids: toolUseIds, msgIndex: i });
   }
 
+  // ── Pass 2: strip markers, fill tool_use_ids ──
   const result: AnthropicMessage[] = [];
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
+
+    // Fix assistant message content: strip markers from text, fill missing tool_use_ids
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const blocks = msg.content as Record<string, unknown>[];
+      let lastToolId: string | undefined;
+      const cleanContent = blocks.map((block) => {
+        // Track the last seen tool_use / server_tool_use id within this assistant message
+        if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
+          lastToolId = block.id as string;
+          return block;
+        }
+        // Fill in missing tool_use_id on tool_result / web_search_tool_result using the marker in text
+        if (
+          (block.type === "tool_result" || block.type === "web_search_tool_result") &&
+          !block.tool_use_id
+        ) {
+          // Prefer the marker extracted from any text block in this same message
+          const markerIds = markerIdsByMsg.get(i)?.ids ?? [];
+          const id = markerIds[0] ?? lastToolId;
+          if (id) return { ...block, tool_use_id: id };
+          return block; // unfixable — leave as-is (will likely 400, but we tried)
+        }
+        // Strip markers from text blocks
+        if (block.type === "text" && typeof block.text === "string") {
+          return { ...block, text: (block.text as string).replace(TOOL_ID_MARKER_RE, "") };
+        }
+        return block;
+      });
+      result.push({ ...msg, content: cleanContent } as AnthropicMessage);
+      continue;
+    }
+
+    // For user messages that may contain tool_result blocks
     if (msg.role === "user" && Array.isArray(msg.content)) {
+      // Determine which id pool to use: prefer marker ids from immediately preceding assistant msg
+      const prevIdx = i - 1;
+      const idPool: string[] = (
+        markerIdsByMsg.get(prevIdx) ??
+        toolUseIdsByMsg.get(prevIdx) ??
+        // walk backwards for older history
+        (() => {
+          for (let j = prevIdx - 1; j >= 0; j--) {
+            const src = markerIdsByMsg.get(j) ?? toolUseIdsByMsg.get(j);
+            if (src) return src;
+          }
+          return undefined;
+        })()
+      )?.ids ?? [];
+
+      let idIndex = 0;
       const sanitizedContent: unknown[] = [];
+
       for (const block of msg.content as Record<string, unknown>[]) {
         if (block.type === "tool_result") {
           if (block.tool_use_id) {
-            // Already has an id — keep as-is
             sanitizedContent.push(block);
           } else {
-            // Find the closest unused tool_use that precedes this message
-            const candidate = allToolUses
-              .filter((e) => e.msgIndex < i && !e.used)
-              .at(-1); // last (closest) unused one before this message
-            if (candidate) {
-              candidate.used = true;
-              sanitizedContent.push({ ...block, tool_use_id: candidate.id });
+            const id = idPool[idIndex++];
+            if (id) {
+              sanitizedContent.push({ ...block, tool_use_id: id });
             }
-            // else: drop the block — can't fix it, would cause a 400 anyway
+            // else drop — unfixable, sending it causes a 400
           }
         } else {
           sanitizedContent.push(block);
         }
       }
-      // Only include the message if it still has content after sanitization
+
       if (sanitizedContent.length > 0) {
         result.push({ ...msg, content: sanitizedContent } as AnthropicMessage);
       }
-    } else {
-      result.push(msg);
+      continue;
     }
+
+    result.push(msg);
   }
+
   return result;
 }
 
@@ -1112,6 +1206,11 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       let inputTokens = 0;
       let outputTokens = 0;
 
+      // For injecting <!-- tool_id:xxx --> into the first text delta after a tool_use block
+      let pendingToolUseId: string | undefined;
+      let markerPendingForBlockIndex = -1;
+      let markerInjectedForBlockIndex = -1;
+
       try {
         const claudeStream = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
 
@@ -1121,6 +1220,37 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
           } else if (event.type === "message_delta") {
             outputTokens = event.usage.output_tokens;
           }
+
+          // Track tool_use blocks so we know which id to embed
+          if (event.type === "content_block_start") {
+            const cb = (event as Record<string, unknown>).content_block as Record<string, unknown>;
+            if ((cb?.type === "tool_use" || cb?.type === "server_tool_use") && typeof cb.id === "string") {
+              pendingToolUseId = cb.id as string;
+            } else if (cb?.type === "text" && pendingToolUseId) {
+              // Next text block after a tool_use — mark its index for injection
+              markerPendingForBlockIndex = (event as Record<string, unknown>).index as number;
+            }
+          }
+
+          // Inject marker into the very first text_delta of the marked block
+          if (
+            event.type === "content_block_delta" &&
+            pendingToolUseId &&
+            (event as Record<string, unknown>).index === markerPendingForBlockIndex &&
+            markerInjectedForBlockIndex !== markerPendingForBlockIndex
+          ) {
+            const delta = (event as Record<string, unknown>).delta as Record<string, unknown>;
+            if (delta?.type === "text_delta" && typeof delta.text === "string") {
+              markerInjectedForBlockIndex = markerPendingForBlockIndex;
+              const injected = {
+                ...event,
+                delta: { ...delta, text: `<!-- tool_id:${pendingToolUseId}-->` + delta.text },
+              };
+              writeAndFlush(res, `event: ${event.type}\ndata: ${JSON.stringify(injected)}\n\n`);
+              continue;
+            }
+          }
+
           writeAndFlush(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
         }
         writeAndFlush(res, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
@@ -1136,8 +1266,13 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
         clearInterval(keepalive);
       }
     } else {
-      const result = await client.messages.create(createParams);
-      const usage = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
+      const rawResult = await client.messages.create(createParams);
+      // Inject <!-- tool_id:xxx --> markers into text blocks that follow tool_use blocks
+      const resultWithMarkers = {
+        ...rawResult,
+        content: injectToolIdMarker(rawResult.content as Record<string, unknown>[]),
+      };
+      const usage = (rawResult as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
       const dur = Date.now() - startTime;
       recordCallStat("local", dur, usage.input_tokens ?? 0, usage.output_tokens ?? 0, undefined, selectedModel);
       pushRequestLog({
@@ -1145,7 +1280,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
         backend: "local", status: 200, duration: dur, stream: false,
         promptTokens: usage.input_tokens ?? 0, completionTokens: usage.output_tokens ?? 0, level: "info",
       });
-      res.json(result);
+      res.json(resultWithMarkers);
     }
   } catch (err: unknown) {
     recordErrorStat("local");
