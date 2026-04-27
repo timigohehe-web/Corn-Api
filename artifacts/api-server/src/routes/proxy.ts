@@ -1035,11 +1035,11 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessa
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       const blocks = msg.content as Record<string, unknown>[];
       let lastToolId: string | undefined;
-      const cleanContent = blocks.map((block) => {
+      const cleanContent = blocks.flatMap((block) => {
         // Track the last seen tool_use / server_tool_use id within this assistant message
         if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
           lastToolId = block.id as string;
-          return block;
+          return [block];
         }
         // Fill in missing tool_use_id on tool_result / web_search_tool_result using the marker in text
         if (
@@ -1049,14 +1049,16 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessa
           // Prefer the marker extracted from any text block in this same message
           const markerIds = markerIdsByMsg.get(i)?.ids ?? [];
           const id = markerIds[0] ?? lastToolId;
-          if (id) return { ...block, tool_use_id: id };
-          return block; // unfixable — leave as-is (will likely 400, but we tried)
+          if (id) return [{ ...block, tool_use_id: id }];
+          return [block]; // unfixable — leave as-is (will likely 400, but we tried)
         }
-        // Strip markers from text blocks
+        // Strip markers from text blocks; drop the block entirely if it becomes empty
         if (block.type === "text" && typeof block.text === "string") {
-          return { ...block, text: (block.text as string).replace(TOOL_ID_MARKER_RE, "") };
+          const cleaned = (block.text as string).replace(TOOL_ID_MARKER_RE, "").trimStart();
+          if (!cleaned) return []; // drop empty text blocks
+          return [{ ...block, text: cleaned }];
         }
-        return block;
+        return [block];
       });
       result.push({ ...msg, content: cleanContent } as AnthropicMessage);
       continue;
