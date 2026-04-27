@@ -958,30 +958,57 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 
 /**
  * Sanitize Anthropic messages before forwarding to the API:
- * - Fill in missing `tool_use_id` on tool_result blocks by matching them to the
- *   preceding assistant message's tool_use block (Vertex AI requires this field).
+ * - Fill in missing `tool_use_id` on tool_result blocks by scanning backwards
+ *   through the conversation to find the matching tool_use block.
+ * - Drop any tool_result block whose tool_use_id still cannot be resolved
+ *   (sending an invalid/missing id causes a Vertex AI 400 error).
+ * - Remove user messages that become empty after stripping bad tool_result blocks.
  */
 function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
-  const result: AnthropicMessage[] = [];
-  for (const msg of messages) {
-    if (msg.role === "user" && Array.isArray(msg.content)) {
-      const prevAssistant = result.length > 0 ? result[result.length - 1] : undefined;
-      const prevToolUses: Record<string, unknown>[] =
-        prevAssistant?.role === "assistant" && Array.isArray(prevAssistant.content)
-          ? (prevAssistant.content as Record<string, unknown>[]).filter((b) => b.type === "tool_use")
-          : [];
-
-      let toolUseIndex = 0;
-      const sanitizedContent = (msg.content as Record<string, unknown>[]).map((block) => {
-        if (block.type === "tool_result" && !block.tool_use_id) {
-          const matchingToolUse = prevToolUses[toolUseIndex++];
-          if (matchingToolUse?.id) {
-            return { ...block, tool_use_id: matchingToolUse.id };
-          }
+  // Build a complete ordered list of all tool_use ids seen in assistant messages,
+  // keyed by their position in the messages array so we can match by proximity.
+  type ToolUseEntry = { msgIndex: number; id: string; used: boolean };
+  const allToolUses: ToolUseEntry[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const block of msg.content as Record<string, unknown>[]) {
+        if (block.type === "tool_use" && typeof block.id === "string") {
+          allToolUses.push({ msgIndex: i, id: block.id as string, used: false });
         }
-        return block;
-      });
-      result.push({ ...msg, content: sanitizedContent } as AnthropicMessage);
+      }
+    }
+  }
+
+  const result: AnthropicMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const sanitizedContent: unknown[] = [];
+      for (const block of msg.content as Record<string, unknown>[]) {
+        if (block.type === "tool_result") {
+          if (block.tool_use_id) {
+            // Already has an id — keep as-is
+            sanitizedContent.push(block);
+          } else {
+            // Find the closest unused tool_use that precedes this message
+            const candidate = allToolUses
+              .filter((e) => e.msgIndex < i && !e.used)
+              .at(-1); // last (closest) unused one before this message
+            if (candidate) {
+              candidate.used = true;
+              sanitizedContent.push({ ...block, tool_use_id: candidate.id });
+            }
+            // else: drop the block — can't fix it, would cause a 400 anyway
+          }
+        } else {
+          sanitizedContent.push(block);
+        }
+      }
+      // Only include the message if it still has content after sanitization
+      if (sanitizedContent.length > 0) {
+        result.push({ ...msg, content: sanitizedContent } as AnthropicMessage);
+      }
     } else {
       result.push(msg);
     }
