@@ -1038,6 +1038,10 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
   // ── Pass 2: strip markers, fill tool_use_ids ──
   const result: AnthropicMessage[] = [];
 
+  // IDs of server_tool_use blocks stripped from assistant messages.
+  // Used to drop matching tool_result blocks in subsequent user messages.
+  const strippedServerToolIds = new Set<string>();
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
@@ -1046,8 +1050,13 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
       const blocks = msg.content as Record<string, unknown>[];
       let lastToolId: string | undefined;
       const cleanContent = blocks.flatMap((block) => {
-        // Strip server-side tool blocks — clients don't store or replay them
-        if (SERVER_TOOL_BLOCK_TYPES.has(block.type as string)) return [];
+        // Strip server-side tool blocks and record their IDs so we can drop
+        // any matching tool_result in the following user message
+        if (SERVER_TOOL_BLOCK_TYPES.has(block.type as string)) {
+          if (typeof block.id === "string") strippedServerToolIds.add(block.id as string);
+          if (typeof block.tool_use_id === "string") strippedServerToolIds.add(block.tool_use_id as string);
+          return [];
+        }
         // Track the last seen tool_use id within this assistant message
         if (block.type === "tool_use" && typeof block.id === "string") {
           lastToolId = block.id as string;
@@ -1094,6 +1103,10 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
 
       for (const block of msg.content as Record<string, unknown>[]) {
         if (block.type === "tool_result") {
+          // Drop tool_result blocks that reference a stripped server_tool_use — no matching tool_use exists
+          if (typeof block.tool_use_id === "string" && strippedServerToolIds.has(block.tool_use_id as string)) {
+            continue;
+          }
           if (block.tool_use_id) {
             sanitizedContent.push(block);
           } else {
