@@ -1156,12 +1156,55 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
     result.push(msg);
   }
 
-  // Claude 4.6+ does not support assistant prefill — append a user "continue" if last message is assistant
-  if (model && modelNoPrefill(model) && result.length > 0 && result[result.length - 1].role === "assistant") {
-    result.push({ role: "user", content: "continue" } as AnthropicMessage);
+  // ── Pass 3: drop orphaned tool_use blocks ──
+  // If an assistant message contains tool_use blocks but the following user message
+  // has no matching tool_result, strip those tool_use blocks entirely so Anthropic
+  // doesn't reject the request with a 400.  Clients that don't send back tool call
+  // history are treated as plain chat turns.
+  const cleaned: AnthropicMessage[] = [];
+  for (let i = 0; i < result.length; i++) {
+    const msg = result[i];
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const blocks = msg.content as Record<string, unknown>[];
+      const toolUseIds = new Set(
+        blocks
+          .filter((b) => b.type === "tool_use" && typeof b.id === "string")
+          .map((b) => b.id as string)
+      );
+
+      if (toolUseIds.size > 0) {
+        // Check whether the next user message has matching tool_result blocks
+        const next = result[i + 1];
+        const nextBlocks = (next?.role === "user" && Array.isArray(next.content))
+          ? (next.content as Record<string, unknown>[])
+          : [];
+        const resultIds = new Set(
+          nextBlocks
+            .filter((b) => b.type === "tool_result" && typeof b.tool_use_id === "string")
+            .map((b) => b.tool_use_id as string)
+        );
+
+        // Strip tool_use blocks that have no corresponding tool_result
+        const orphanIds = new Set([...toolUseIds].filter((id) => !resultIds.has(id)));
+        if (orphanIds.size > 0) {
+          const strippedBlocks = blocks.filter(
+            (b) => !(b.type === "tool_use" && orphanIds.has(b.id as string))
+          );
+          if (strippedBlocks.length === 0) continue; // drop empty assistant message
+          cleaned.push({ ...msg, content: strippedBlocks } as AnthropicMessage);
+          continue;
+        }
+      }
+    }
+    cleaned.push(msg);
   }
 
-  return result;
+  // Claude 4.6+ does not support assistant prefill — append a user "continue" if last message is assistant
+  if (model && modelNoPrefill(model) && cleaned.length > 0 && cleaned[cleaned.length - 1].role === "assistant") {
+    cleaned.push({ role: "user", content: "continue" } as AnthropicMessage);
+  }
+
+  return cleaned;
 }
 
 router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) => {
