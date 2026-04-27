@@ -1259,11 +1259,6 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       let inputTokens = 0;
       let outputTokens = 0;
 
-      // For injecting <!-- tool_id:xxx --> into the first text delta after a tool_use block
-      let pendingToolUseId: string | undefined;
-      let markerPendingForBlockIndex = -1;
-      let markerInjectedForBlockIndex = -1;
-
       try {
         const claudeStream = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
 
@@ -1272,37 +1267,6 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
             inputTokens = event.message.usage.input_tokens;
           } else if (event.type === "message_delta") {
             outputTokens = event.usage.output_tokens;
-          }
-
-          // Track tool_use blocks so we know which id to embed
-          if (event.type === "content_block_start") {
-            const ev = event as Record<string, unknown>;
-            const cb = ev.content_block as Record<string, unknown>;
-            const idx = ev.index as number;
-            if ((cb?.type === "tool_use" || cb?.type === "server_tool_use") && typeof cb.id === "string") {
-              pendingToolUseId = cb.id as string;
-            } else if (cb?.type === "text" && pendingToolUseId) {
-              markerPendingForBlockIndex = idx;
-            }
-          }
-
-          // Inject marker into the very first text_delta of the marked block
-          if (
-            event.type === "content_block_delta" &&
-            pendingToolUseId &&
-            (event as Record<string, unknown>).index === markerPendingForBlockIndex &&
-            markerInjectedForBlockIndex !== markerPendingForBlockIndex
-          ) {
-            const delta = (event as Record<string, unknown>).delta as Record<string, unknown>;
-            if (delta?.type === "text_delta" && typeof delta.text === "string") {
-              markerInjectedForBlockIndex = markerPendingForBlockIndex;
-              const injected = {
-                ...event,
-                delta: { ...delta, text: `<!-- tool_id:${pendingToolUseId}-->` + delta.text },
-              };
-              writeAndFlush(res, `event: ${event.type}\ndata: ${JSON.stringify(injected)}\n\n`);
-              continue;
-            }
           }
 
           writeAndFlush(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
@@ -1321,11 +1285,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       }
     } else {
       const rawResult = await client.messages.create(createParams);
-      // Inject <!-- tool_id:xxx --> markers into text blocks that follow tool_use blocks
-      const resultWithMarkers = {
-        ...rawResult,
-        content: injectToolIdMarker(rawResult.content as Record<string, unknown>[]),
-      };
+      const resultWithMarkers = rawResult;
       const usage = (rawResult as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
       const dur = Date.now() - startTime;
       recordCallStat("local", dur, usage.input_tokens ?? 0, usage.output_tokens ?? 0, undefined, selectedModel);
