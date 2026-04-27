@@ -1132,11 +1132,9 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
     result.push(msg);
   }
 
-  // Claude 4.6+ does not support assistant prefill — remove trailing assistant messages
-  if (model && modelNoPrefill(model)) {
-    while (result.length > 0 && result[result.length - 1].role === "assistant") {
-      result.pop();
-    }
+  // Claude 4.6+ does not support assistant prefill — append a user "continue" if last message is assistant
+  if (model && modelNoPrefill(model) && result.length > 0 && result[result.length - 1].role === "assistant") {
+    result.push({ role: "user", content: "continue" } as AnthropicMessage);
   }
 
   return result;
