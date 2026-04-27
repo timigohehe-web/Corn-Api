@@ -31,6 +31,11 @@ const ANTHROPIC_SEARCH_MODELS = [
   "claude-opus-4-6-search",
 ];
 
+// Models that support 300k output via beta header (opus/sonnet 4.6+)
+const ANTHROPIC_300K_BASE_MODELS = [
+  "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6",
+];
+
 const GEMINI_BASE_MODELS = [
   "gemini-3.1-pro-preview", "gemini-3-flash-preview",
   "gemini-2.5-pro", "gemini-2.5-flash",
@@ -158,6 +163,9 @@ for (const base of ANTHROPIC_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "anthropic");
 }
 for (const id of ANTHROPIC_SEARCH_MODELS) { MODEL_PROVIDER_MAP.set(id, "anthropic"); }
+for (const base of ANTHROPIC_300K_BASE_MODELS) {
+  MODEL_PROVIDER_MAP.set(`${base}-300k-thinking`, "anthropic");
+}
 for (const base of GEMINI_BASE_MODELS) {
   MODEL_PROVIDER_MAP.set(base, "gemini");
   MODEL_PROVIDER_MAP.set(`${base}-thinking`, "gemini");
@@ -842,8 +850,10 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
       } else if (isClaudeModel) {
         const webSearch = selectedModel.endsWith("-search");
         const stripped = webSearch ? selectedModel.replace(/-search$/, "") : selectedModel;
-        const thinkingEnabled = stripped.endsWith("-thinking");
-        const resolvedModel = thinkingEnabled ? stripped.replace(/-thinking$/, "") : stripped;
+        const is300k = stripped.includes("-300k");
+        const strippedOf300k = is300k ? stripped.replace("-300k", "") : stripped;
+        const thinkingEnabled = strippedOf300k.endsWith("-thinking");
+        const resolvedModel = thinkingEnabled ? strippedOf300k.replace(/-thinking$/, "") : strippedOf300k;
         const CLAUDE_MODEL_MAX: Record<string, number> = {
           "claude-haiku-4-5": 8096,
           "claude-sonnet-4-5": 64000,
@@ -853,10 +863,10 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
           "claude-opus-4-6": 128000,
           "claude-opus-4-7": 128000,
         };
-        const modelMax = CLAUDE_MODEL_MAX[resolvedModel] ?? 32000;
+        const modelMax = is300k ? 300000 : (CLAUDE_MODEL_MAX[resolvedModel] ?? 32000);
         const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
         const client = makeLocalAnthropic();
-        result = await handleClaude({ req, res, client, model: resolvedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible: thinkingEnabled, tools, toolChoice: tool_choice, webSearch, startTime });
+        result = await handleClaude({ req, res, client, model: resolvedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, temperature, topP: top_p, thinking: thinkingEnabled, thinkingVisible: thinkingEnabled, tools, toolChoice: tool_choice, webSearch, use300k: is300k, startTime });
       } else if (isGeminiModel) {
         const thinkingEnabled = selectedModel.endsWith("-thinking");
         const actualModel = thinkingEnabled ? selectedModel.replace(/-thinking$/, "") : selectedModel;
@@ -2041,7 +2051,7 @@ async function handleGemini({
 }
 
 async function handleClaude({
-  req, res, client, model, messages, stream, maxTokens, temperature, topP, thinking = false, thinkingVisible = false, tools, toolChoice, webSearch = false, startTime,
+  req, res, client, model, messages, stream, maxTokens, temperature, topP, thinking = false, thinkingVisible = false, tools, toolChoice, webSearch = false, use300k = false, startTime,
 }: {
   req: Request;
   res: Response;
@@ -2057,6 +2067,7 @@ async function handleClaude({
   tools?: OAITool[];
   toolChoice?: unknown;
   webSearch?: boolean;
+  use300k?: boolean;
   startTime: number;
 }): Promise<{ promptTokens: number; completionTokens: number; ttftMs?: number }> {
   // Extract system prompt
@@ -2070,9 +2081,16 @@ async function handleClaude({
 
   const isAdaptiveThinkingModel = model.includes("4-6") || model.includes("4.6") || model.includes("4-7") || model.includes("4.7");
   const thinkingParam = thinking
-    ? isAdaptiveThinkingModel
-      ? { thinking: { type: "adaptive" as const }, output_config: { effort: "xhigh" } }
-      : { thinking: { type: "enabled" as const, budget_tokens: 16000 } }
+    ? use300k
+      ? { thinking: { type: "enabled" as const, effort: "max" } }
+      : isAdaptiveThinkingModel
+        ? { thinking: { type: "adaptive" as const }, output_config: { effort: "xhigh" } }
+        : { thinking: { type: "enabled" as const, budget_tokens: 16000 } }
+    : {};
+
+  // Per-request options: inject 300k beta header when needed
+  const requestOptions = use300k
+    ? { headers: { "anthropic-beta": "output-300k-2026-03-24" } }
     : {};
 
   // Convert tools to Anthropic format
@@ -2100,7 +2118,7 @@ async function handleClaude({
   const buildCreateParams = () => ({
     model,
     max_tokens: maxTokens,
-    ...(isAdaptiveThinkingModel
+    ...((isAdaptiveThinkingModel && !use300k)
       ? {}
       : { temperature: temperature ?? 1 }),
     ...(systemMessages ? { system: systemMessages } : {}),
@@ -2120,7 +2138,7 @@ async function handleClaude({
     req.on("close", () => clearInterval(keepalive));
 
     try {
-      const claudeStream = client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0]);
+      const claudeStream = client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0], requestOptions);
 
       let inputTokens = 0;
       let outputTokens = 0;
@@ -2182,12 +2200,12 @@ async function handleClaude({
     // detect the error and transparently upgrade to stream + collect.
     let result: Anthropic.Message;
     try {
-      result = await client.messages.create(buildCreateParams() as Parameters<typeof client.messages.create>[0]);
+      result = await client.messages.create(buildCreateParams() as Parameters<typeof client.messages.create>[0], requestOptions);
     } catch (nonStreamErr: unknown) {
       const errMsg = nonStreamErr instanceof Error ? nonStreamErr.message : String(nonStreamErr);
       if (/streaming.*required|requires.*stream/i.test(errMsg)) {
         req.log.warn("Claude model requires streaming — upgrading to stream+collect for non-stream request");
-        const claudeStream = client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0]);
+        const claudeStream = client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0], requestOptions);
         const collected = await claudeStream.finalMessage();
         result = collected;
       } else {
