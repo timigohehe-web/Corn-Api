@@ -996,7 +996,14 @@ function injectToolIdMarker(
  * 4. Drop any tool_result block that still has no resolvable id.
  * 5. Remove user messages that become empty after dropping bad blocks.
  */
-function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
+/** Returns true if the model version is 4.6 or newer (no assistant prefill support). */
+function modelNoPrefill(model: string): boolean {
+  const m = model.match(/-(\d+)-(\d+)/);
+  if (!m) return false;
+  return parseInt(m[1]) * 100 + parseInt(m[2]) >= 406;
+}
+
+function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string): AnthropicMessage[] {
   // ── Pass 1: collect marker-based ids & fallback tool_use ids per message ──
   type IdSource = { ids: string[]; msgIndex: number };
   const markerIdsByMsg = new Map<number, IdSource>(); // assistant msgIndex → ids from markers
@@ -1125,9 +1132,11 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessa
     result.push(msg);
   }
 
-  // Ensure conversation ends with a user message (some models reject assistant prefill)
-  while (result.length > 0 && result[result.length - 1].role === "assistant") {
-    result.pop();
+  // Claude 4.6+ does not support assistant prefill — remove trailing assistant messages
+  if (model && modelNoPrefill(model)) {
+    while (result.length > 0 && result[result.length - 1].role === "assistant") {
+      result.pop();
+    }
   }
 
   return result;
@@ -1200,7 +1209,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   }
 
   // Sanitize messages: fill in missing tool_use_id on tool_result blocks
-  const sanitizedMessages = sanitizeAnthropicMessages(messages);
+  const sanitizedMessages = sanitizeAnthropicMessages(messages, selectedModel);
 
   try {
     const client = makeLocalAnthropic();
