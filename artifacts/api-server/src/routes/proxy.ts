@@ -1100,8 +1100,24 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessa
         }
       }
 
-      if (sanitizedContent.length > 0) {
-        result.push({ ...msg, content: sanitizedContent } as AnthropicMessage);
+      // Also drop empty text blocks that clients sometimes send
+      const finalContent = sanitizedContent.filter(
+        (b) => !((b as Record<string, unknown>).type === "text" && ((b as Record<string, unknown>).text === "" || (b as Record<string, unknown>).text == null))
+      );
+
+      if (finalContent.length > 0) {
+        result.push({ ...msg, content: finalContent } as AnthropicMessage);
+      }
+      continue;
+    }
+
+    // Fallback: pass through other messages but still strip empty text blocks
+    if (Array.isArray(msg.content)) {
+      const cleaned = (msg.content as Record<string, unknown>[]).filter(
+        (b) => !(b.type === "text" && (b.text === "" || b.text == null))
+      );
+      if (cleaned.length > 0) {
+        result.push({ ...msg, content: cleaned } as AnthropicMessage);
       }
       continue;
     }
