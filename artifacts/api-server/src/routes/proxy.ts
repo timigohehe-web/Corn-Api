@@ -956,6 +956,39 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 // Accepts Anthropic API format directly (for clients like Cherry Studio, Claude.ai compatible tools)
 // ---------------------------------------------------------------------------
 
+/**
+ * Sanitize Anthropic messages before forwarding to the API:
+ * - Fill in missing `tool_use_id` on tool_result blocks by matching them to the
+ *   preceding assistant message's tool_use block (Vertex AI requires this field).
+ */
+function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
+  const result: AnthropicMessage[] = [];
+  for (const msg of messages) {
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const prevAssistant = result.length > 0 ? result[result.length - 1] : undefined;
+      const prevToolUses: Record<string, unknown>[] =
+        prevAssistant?.role === "assistant" && Array.isArray(prevAssistant.content)
+          ? (prevAssistant.content as Record<string, unknown>[]).filter((b) => b.type === "tool_use")
+          : [];
+
+      let toolUseIndex = 0;
+      const sanitizedContent = (msg.content as Record<string, unknown>[]).map((block) => {
+        if (block.type === "tool_result" && !block.tool_use_id) {
+          const matchingToolUse = prevToolUses[toolUseIndex++];
+          if (matchingToolUse?.id) {
+            return { ...block, tool_use_id: matchingToolUse.id };
+          }
+        }
+        return block;
+      });
+      result.push({ ...msg, content: sanitizedContent } as AnthropicMessage);
+    } else {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
 router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) => {
   const body = req.body as {
     model?: string;
@@ -1016,17 +1049,26 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   const webSearchTool = webSearch ? [{ type: "web_search_20250305", name: "web_search" }] : [];
   const mergedTools = [...webSearchTool, ...(clientTools ?? [])];
 
+  // Vertex AI rejects requests that specify both temperature and top_p — drop top_p
+  const safeRest = { ...(rest as Record<string, unknown>) };
+  if (safeRest.temperature !== undefined && safeRest.top_p !== undefined) {
+    delete safeRest.top_p;
+  }
+
+  // Sanitize messages: fill in missing tool_use_id on tool_result blocks
+  const sanitizedMessages = sanitizeAnthropicMessages(messages);
+
   try {
     const client = makeLocalAnthropic();
 
     const createParams = {
       model: selectedModel,
       max_tokens: maxTokens,
-      messages,
+      messages: sanitizedMessages,
       ...(system ? { system } : {}),
       ...thinkingParam,
       ...(mergedTools.length ? { tools: mergedTools } : {}),
-      ...rest,
+      ...safeRest,
     } as Parameters<typeof client.messages.create>[0];
 
     if (shouldStream) {
