@@ -964,24 +964,29 @@ const TOOL_ID_MARKER_RE = /<!--\s*tool_id:([^-\s]+?)\s*-->/g;
  * This lets clients that strip tool_use metadata still carry the id in text,
  * so we can recover it on the next request without scanning history.
  */
+// Block types produced by Anthropic's built-in server-side tools (e.g. web_search_20250305).
+// We strip these from responses and history — clients don't need to see or replay them.
+const SERVER_TOOL_BLOCK_TYPES = new Set(["server_tool_use", "web_search_tool_result"]);
+
 function injectToolIdMarker(
   content: Record<string, unknown>[]
 ): Record<string, unknown>[] {
   let lastToolUseId: string | undefined;
   let markerInjected = false;
-  return content.map((block) => {
-    // Both regular tool_use and built-in server_tool_use (e.g. web_search_20250305)
-    if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
-      lastToolUseId = block.id as string;
-      markerInjected = false;
+  return content
+    .filter((b) => !SERVER_TOOL_BLOCK_TYPES.has(b.type as string))
+    .map((block) => {
+      if (block.type === "tool_use" && typeof block.id === "string") {
+        lastToolUseId = block.id as string;
+        markerInjected = false;
+        return block;
+      }
+      if (block.type === "text" && lastToolUseId && !markerInjected) {
+        markerInjected = true;
+        return { ...block, text: `<!-- tool_id:${lastToolUseId}-->` + (block.text ?? "") };
+      }
       return block;
-    }
-    if (block.type === "text" && lastToolUseId && !markerInjected) {
-      markerInjected = true;
-      return { ...block, text: `<!-- tool_id:${lastToolUseId}-->` + (block.text ?? "") };
-    }
-    return block;
-  });
+    });
 }
 
 /**
@@ -1043,21 +1048,19 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
       const blocks = msg.content as Record<string, unknown>[];
       let lastToolId: string | undefined;
       const cleanContent = blocks.flatMap((block) => {
-        // Track the last seen tool_use / server_tool_use id within this assistant message
-        if ((block.type === "tool_use" || block.type === "server_tool_use") && typeof block.id === "string") {
+        // Strip server-side tool blocks — clients don't store or replay them
+        if (SERVER_TOOL_BLOCK_TYPES.has(block.type as string)) return [];
+        // Track the last seen tool_use id within this assistant message
+        if (block.type === "tool_use" && typeof block.id === "string") {
           lastToolId = block.id as string;
           return [block];
         }
-        // Fill in missing tool_use_id on tool_result / web_search_tool_result using the marker in text
-        if (
-          (block.type === "tool_result" || block.type === "web_search_tool_result") &&
-          !block.tool_use_id
-        ) {
-          // Prefer the marker extracted from any text block in this same message
+        // Fill in missing tool_use_id on tool_result blocks using the marker in text
+        if (block.type === "tool_result" && !block.tool_use_id) {
           const markerIds = markerIdsByMsg.get(i)?.ids ?? [];
           const id = markerIds[0] ?? lastToolId;
           if (id) return [{ ...block, tool_use_id: id }];
-          return [block]; // unfixable — leave as-is (will likely 400, but we tried)
+          return [block];
         }
         // Strip markers from text blocks; drop the block entirely if it becomes empty
         if (block.type === "text" && typeof block.text === "string") {
@@ -1240,6 +1243,8 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       let pendingToolUseId: string | undefined;
       let markerPendingForBlockIndex = -1;
       let markerInjectedForBlockIndex = -1;
+      // Indices of server_tool_use / web_search_tool_result blocks to suppress in stream
+      const suppressedBlockIndices = new Set<number>();
 
       try {
         const claudeStream = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
@@ -1251,15 +1256,28 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
             outputTokens = event.usage.output_tokens;
           }
 
-          // Track tool_use blocks so we know which id to embed
+          // Track block types at start; suppress server tool blocks entirely
           if (event.type === "content_block_start") {
-            const cb = (event as Record<string, unknown>).content_block as Record<string, unknown>;
-            if ((cb?.type === "tool_use" || cb?.type === "server_tool_use") && typeof cb.id === "string") {
+            const ev = event as Record<string, unknown>;
+            const cb = ev.content_block as Record<string, unknown>;
+            const idx = ev.index as number;
+            if (SERVER_TOOL_BLOCK_TYPES.has(cb?.type as string)) {
+              suppressedBlockIndices.add(idx);
+              continue; // don't forward this event
+            }
+            if (cb?.type === "tool_use" && typeof cb.id === "string") {
               pendingToolUseId = cb.id as string;
             } else if (cb?.type === "text" && pendingToolUseId) {
-              // Next text block after a tool_use — mark its index for injection
-              markerPendingForBlockIndex = (event as Record<string, unknown>).index as number;
+              markerPendingForBlockIndex = idx;
             }
+          }
+
+          // Skip deltas and stops for suppressed blocks
+          if (
+            (event.type === "content_block_delta" || event.type === "content_block_stop") &&
+            suppressedBlockIndices.has((event as Record<string, unknown>).index as number)
+          ) {
+            continue;
           }
 
           // Inject marker into the very first text_delta of the marked block
