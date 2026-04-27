@@ -1156,24 +1156,35 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
     result.push(msg);
   }
 
-  // ── Pass 3: drop orphaned tool_use blocks ──
-  // If an assistant message contains tool_use blocks but the following user message
-  // has no matching tool_result, strip those tool_use blocks entirely so Anthropic
-  // doesn't reject the request with a 400.  Clients that don't send back tool call
-  // history are treated as plain chat turns.
+  // ── Pass 3: drop orphaned tool_use / tool_result blocks ──
+  // If an assistant message has tool_use blocks with no matching tool_result in the
+  // next user message, strip those tool_use blocks.
+  // If a user message has tool_result blocks with no tool_use_id, or whose
+  // tool_use_id has no matching tool_use in the previous assistant message, drop them.
+  // Clients that don't send back full tool call history are treated as plain chat.
   const cleaned: AnthropicMessage[] = [];
+
+  // Collect all surviving tool_use IDs per message index after Pass 2
+  const survivingToolUseIds = new Map<number, Set<string>>();
   for (let i = 0; i < result.length; i++) {
     const msg = result[i];
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      const blocks = msg.content as Record<string, unknown>[];
-      const toolUseIds = new Set(
-        blocks
+      const ids = new Set(
+        (msg.content as Record<string, unknown>[])
           .filter((b) => b.type === "tool_use" && typeof b.id === "string")
           .map((b) => b.id as string)
       );
+      if (ids.size > 0) survivingToolUseIds.set(i, ids);
+    }
+  }
 
-      if (toolUseIds.size > 0) {
-        // Check whether the next user message has matching tool_result blocks
+  for (let i = 0; i < result.length; i++) {
+    const msg = result[i];
+
+    // Strip orphaned tool_use blocks from assistant messages
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const toolUseIds = survivingToolUseIds.get(i);
+      if (toolUseIds && toolUseIds.size > 0) {
         const next = result[i + 1];
         const nextBlocks = (next?.role === "user" && Array.isArray(next.content))
           ? (next.content as Record<string, unknown>[])
@@ -1183,19 +1194,36 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[], model?: string)
             .filter((b) => b.type === "tool_result" && typeof b.tool_use_id === "string")
             .map((b) => b.tool_use_id as string)
         );
-
-        // Strip tool_use blocks that have no corresponding tool_result
         const orphanIds = new Set([...toolUseIds].filter((id) => !resultIds.has(id)));
         if (orphanIds.size > 0) {
-          const strippedBlocks = blocks.filter(
+          // Remove stripped IDs so the user-message pass knows they're gone
+          orphanIds.forEach((id) => toolUseIds.delete(id));
+          const strippedBlocks = (msg.content as Record<string, unknown>[]).filter(
             (b) => !(b.type === "tool_use" && orphanIds.has(b.id as string))
           );
-          if (strippedBlocks.length === 0) continue; // drop empty assistant message
+          if (strippedBlocks.length === 0) continue;
           cleaned.push({ ...msg, content: strippedBlocks } as AnthropicMessage);
           continue;
         }
       }
     }
+
+    // Strip orphaned / id-less tool_result blocks from user messages
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const prevToolUseIds = survivingToolUseIds.get(i - 1) ?? new Set<string>();
+      const sanitized = (msg.content as Record<string, unknown>[]).filter((b) => {
+        if (b.type !== "tool_result") return true;
+        const tid = b.tool_use_id as string | undefined;
+        // Drop if no id, or if the matching tool_use was stripped / never existed
+        if (!tid) return false;
+        if (prevToolUseIds.size > 0 && !prevToolUseIds.has(tid)) return false;
+        return true;
+      });
+      if (sanitized.length === 0) continue;
+      cleaned.push({ ...msg, content: sanitized } as AnthropicMessage);
+      continue;
+    }
+
     cleaned.push(msg);
   }
 
