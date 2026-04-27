@@ -1125,6 +1125,11 @@ function sanitizeAnthropicMessages(messages: AnthropicMessage[]): AnthropicMessa
     result.push(msg);
   }
 
+  // Ensure conversation ends with a user message (some models reject assistant prefill)
+  while (result.length > 0 && result[result.length - 1].role === "assistant") {
+    result.pop();
+  }
+
   return result;
 }
 
