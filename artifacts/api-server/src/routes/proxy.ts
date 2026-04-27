@@ -847,11 +847,11 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         const CLAUDE_MODEL_MAX: Record<string, number> = {
           "claude-haiku-4-5": 8096,
           "claude-sonnet-4-5": 64000,
-          "claude-sonnet-4-6": 64000,
+          "claude-sonnet-4-6": 128000,
           "claude-opus-4-1": 64000,
           "claude-opus-4-5": 64000,
-          "claude-opus-4-6": 64000,
-          "claude-opus-4-7": 64000,
+          "claude-opus-4-6": 128000,
+          "claude-opus-4-7": 128000,
         };
         const modelMax = CLAUDE_MODEL_MAX[resolvedModel] ?? 32000;
         const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
@@ -1186,11 +1186,11 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   const CLAUDE_MODEL_MAX: Record<string, number> = {
     "claude-haiku-4-5": 8096,
     "claude-sonnet-4-5": 64000,
-    "claude-sonnet-4-6": 64000,
+    "claude-sonnet-4-6": 128000,
     "claude-opus-4-1": 64000,
     "claude-opus-4-5": 64000,
-    "claude-opus-4-6": 64000,
-    "claude-opus-4-7": 64000,
+    "claude-opus-4-6": 128000,
+    "claude-opus-4-7": 128000,
   };
   const modelMax = CLAUDE_MODEL_MAX[selectedModel] ?? 32000;
   const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
@@ -1202,12 +1202,11 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   req.log.info({ model: selectedModel, rawModel, stream: shouldStream, webSearch, thinking: thinkingEnabled }, "Anthropic /v1/messages request");
 
   // Build thinking param if needed (and not already provided by client)
-  const isAdaptiveThinkingModel = selectedModel.includes("4-7") || selectedModel.includes("4.7");
-  const THINKING_BUDGET = 16000;
+  const isAdaptiveThinkingModel = selectedModel.includes("4-6") || selectedModel.includes("4.6") || selectedModel.includes("4-7") || selectedModel.includes("4.7");
   const thinkingParam = thinkingEnabled && !rest.thinking
     ? isAdaptiveThinkingModel
       ? { thinking: { type: "adaptive" as const }, output_config: { effort: "xhigh" } }
-      : { thinking: { type: "enabled" as const, budget_tokens: THINKING_BUDGET } }
+      : { thinking: { type: "enabled" as const, budget_tokens: 16000 } }
     : {};
 
   // Inject web_search tool if needed, alongside any client-supplied tools
@@ -2060,8 +2059,6 @@ async function handleClaude({
   webSearch?: boolean;
   startTime: number;
 }): Promise<{ promptTokens: number; completionTokens: number; ttftMs?: number }> {
-  const THINKING_BUDGET = 16000;
-
   // Extract system prompt
   const systemMessages = messages
     .filter((m) => m.role === "system")
@@ -2071,11 +2068,11 @@ async function handleClaude({
   // Convert all messages including tool_calls / tool roles
   const chatMessages = convertMessagesForClaude(messages);
 
-  const isAdaptiveThinkingModel = model.includes("4-7") || model.includes("4.7");
+  const isAdaptiveThinkingModel = model.includes("4-6") || model.includes("4.6") || model.includes("4-7") || model.includes("4.7");
   const thinkingParam = thinking
     ? isAdaptiveThinkingModel
       ? { thinking: { type: "adaptive" as const }, output_config: { effort: "xhigh" } }
-      : { thinking: { type: "enabled" as const, budget_tokens: THINKING_BUDGET } }
+      : { thinking: { type: "enabled" as const, budget_tokens: 16000 } }
     : {};
 
   // Convert tools to Anthropic format
